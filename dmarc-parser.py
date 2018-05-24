@@ -1,24 +1,31 @@
+# -*- coding: utf-8 -*-
 #!/usr/bin/env python
 
 from collections import defaultdict
 from xml.etree.ElementTree import *
-import ConfigParser
+import configparser
 import binascii
 import datetime
 import email
 import getopt
 import imaplib
+import json
 import os
 import re
 import socket
 import sys
 import zipfile
+import gzip
+import shutil
+import base64
+import logging
 
 from dns import resolver, reversename
+#from leo.commands.commanderFileCommands import saveAsUnzipped
 
 
 DEBUG = 0
-conf_file = '/etc/dmarc-parser/config.ini'
+conf_file = 'config.ini'
 # a list of reports
 reports = []
 do_imap = False
@@ -29,20 +36,14 @@ dns_resolver.lifetime = 2
 
 
 def usage():
-    print '''
+    print ('''
 dmarc-parser.py: parse a dmarc XML report
     <-f>        DMARC XML report file
     <-c>        configuration file (default: /etc/dmarc-parser/config.ini)
     <--imap>    Pull UNSEEN emails from IMAP server (as configured in config.ini)
     <-D>        debug mode (more verbose)
     <-h>        help
-'''
-
-
-def log(msg):
-    if DEBUG == 1:
-        print msg
-
+''')
 
 def ret_val(node, path):
     if node.find(path) is None:
@@ -61,9 +62,30 @@ def unzip(filename):
             for report_re in PARSED_REPORTS:
                 if re.match(report_re, member):
                     zf.extract(member, report_dir)
+                    zf.close()
                     return member
     # delete zip file
-    # os.delete(filename)
+    #os.delete(filename)
+    return False
+
+def ungz(filename):
+    """ Unzip the members of a zipfile into report_dir
+        only if their filename matched the regexes in PARSED_REPORTS
+        and return the member name
+    """      
+    with gzip.open(filename, 'rb') as f_in:
+        member = os.path.basename(filename[:-3])
+        #print('gz entry found: %s' % member)
+        for report_re in PARSED_REPORTS:
+            if re.match(report_re, member):
+                #print('%s%s' % (report_dir,member))
+                with open('%s%s' % (report_dir,member), 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                    f_out.close()
+                    f_in.close()
+                    return member
+    # delete zip file
+    #os.delete(filename)
     return False
 
 
@@ -74,8 +96,10 @@ def imap_fetch_latest_reports():
     """
     ziplist = []
     # create an imap ssl connection
-    log('initializing connection to %s:%s' % (imap_server, imap_port))
-    imap = imaplib.IMAP4_SSL(imap_server, imap_port)
+    logging.debug('initializing connection to %s:%s' % (imap_server, imap_port))
+    #imap = imaplib.IMAP4_SSL(imap_server, imap_port)
+    #print (imap_server, imap_port, imap_user)
+    imap = imaplib.IMAP4_SSL(imap_server)
     imap.login(imap_user, imap_passwd)
 
     # select the imap folder
@@ -87,27 +111,28 @@ def imap_fetch_latest_reports():
 
     # iterate through the list on messages
     for number in message_number[0].split():
-        log('found unread email #%s' % (number,))
+        logging.debug('found unread email #%s' % (number,))
         # fetch the current message
         typ, data = imap.fetch(number, '(RFC822)')
 
-        message = email.message_from_string(data[0][1])
+        #message = email.message_from_string(data[0][1])
+        message = email.message_from_bytes(data[0][1])
 
         # loop over the attachments
         for part in message.walk():
             attach_name = part.get_filename()
             if attach_name:
-                if not attach_name.endswith('.zip'):
-                    log('ignoring non-zip attachment "{0}"'.format(attach_name))
+                if not attach_name.endswith('.zip') and not attach_name.endswith('.gz'):
+                    logging.debug('ignoring non-zip attachment "{0}"'.format(attach_name))
                     continue
 
-                log('extracting attachment')
+                logging.debug('extracting attachment')
                 # extract the attachment from the email
                 attach_dest = zip_dir + attach_name
                 try:
                     attach_data = email.base64mime.decode(part.get_payload())
                 except binascii.Error:
-                    log('could not decode attachment "{0}"'.format(attach_name))
+                    logging.error('could not decode attachment "{0}"'.format(attach_name))
                     continue
                 with open(attach_dest, "wb") as fd:
                     fd.write(attach_data)
@@ -116,10 +141,13 @@ def imap_fetch_latest_reports():
     imap.close()
     imap.logout()
     for zipped_report in ziplist:
-        log('unzipping report %s' % (zipped_report,))
-        report = unzip(zipped_report)
+        logging.debug('unzipping report %s' % (zipped_report,))
+        if zipped_report.endswith('.zip'):
+            report = unzip(zipped_report)
+        elif zipped_report.endswith('.gz'):
+            report = ungz(zipped_report)
         if report:
-            reports.append(report_dir + report)
+            reports.append(report_dir + str(report))
     return reports
 
 
@@ -171,7 +199,7 @@ def dmarc_parse_record(record):
 
 
 def ptr_lookup(ip):
-    log('PTR lookup for %s' % ip)
+    logging.debug('PTR lookup for %s' % ip)
     # reverse DNS lookup
     rev_ip = reversename.from_address(ip)
     try:
@@ -191,18 +219,20 @@ def record_failures(record, type_):
 
 
 def make_graphite_metrics(report, type_):
-    dkim_metric = 'mail.dmarc.{0}.{1}.dkim {2} {3}\n'.format(
+    dkim_metric = 'carbon.agents.hfm-nag-a.dmarc.{0}.{1}.dkim {2} {3}\n'.format(
         report.find('report_metadata/org_name').text.replace('.', '_'),
         type_,
         dkim_fail[type_],
         report.find('report_metadata/date_range/end').text
     )
-    spf_metric = 'mail.dmarc.{0}.{1}.spf {2} {3}\n'.format(
+    spf_metric = 'carbon.agents.hfm-nag-a.dmarc.{0}.{1}.spf {2} {3}\n'.format(
         report.find('report_metadata/org_name').text.replace('.', '_'),
         type_,
         spf_fail[type_],
         report.find('report_metadata/date_range/end').text
     )
+    #print('DEBUG:')
+    #print('{0}{1}'.format(dkim_metric, spf_metric))
     return '{0}{1}'.format(dkim_metric, spf_metric)
 
 
@@ -231,8 +261,13 @@ for argument, value in args_list:
         usage()
         sys.exit()
 
+'''Initialize Log file'''
+sDate = datetime.datetime.now().strftime("%Y%m%d") 
+logging.basicConfig(filename='%s_DMARC_Reports.log' % (sDate), format='%(asctime)s %(levelname)s %(message)s' ,filemode='w', level=logging.DEBUG)
+logging.info('dmarc-parser gestartet')
+
 '''Read configuration file'''
-config = ConfigParser.ConfigParser()
+config = configparser.ConfigParser()
 config.read(conf_file)
 
 PARSED_REPORTS = []
@@ -254,7 +289,7 @@ if do_imap:
     imap_server = config.get('IMAP', 'server')
     imap_port = int(config.get('IMAP', 'port'))
     imap_user = config.get('IMAP', 'user')
-    imap_passwd = config.get('IMAP', 'passwd')
+    imap_passwd = base64.b64decode(config.get('IMAP', 'passwd')).decode('utf-8')
     dmarc_folder = config.get('IMAP', 'dmarc_folder')
     report_dir = config.get('DIRS', 'report')
     zip_dir = config.get('DIRS', 'zip')
@@ -266,7 +301,7 @@ if do_imap:
     reports = imap_fetch_latest_reports()
 
 if len(reports) < 1:
-    print('\nNo report to process\n')
+    logging.info('No report to process')
     usage()
     sys.exit()
 
@@ -300,10 +335,10 @@ for report_file in reports:
     try:
         report = tree.parse(report_file)
     except IOError:
-        print("Can't open %s. IOError" % report_file)
+        logging.error("Can't open %s. IOError" % report_file)
         continue
 
-    print('''Parsing DMARC report %s from %s\nperiod starts %s ends %s''' % (
+    logging.info('''Parsing DMARC report %s from %s\nperiod starts %s ends %s''' % (
         report.find('report_metadata/report_id').text,
         report.find('report_metadata/org_name').text,
         datetime.datetime.fromtimestamp(
@@ -314,10 +349,10 @@ for report_file in reports:
         ).strftime('%Y-%m-%d %H:%M:%S'),
     ))
 
-    print('\nTXT record: %s\n' %
+    logging.info('\nTXT record: %s\n' %
         str(dns_resolver.query(txt_record, 'TXT')[0]))
 
-    print('''Policy detected:
+    logging.info('''Policy detected:
         domain: %s
         adkim:  %s (dkim identifier alignment {relaxed|strict})
         aspf:   %s (spf identified alignment {relaxed|strict})
@@ -373,7 +408,7 @@ for report_file in reports:
         records[counter].node = current_record
         counter += 1
 
-    print('''Totals:
+    logging.info('''Totals:
         %s hits
         %s records
         %s IPs
@@ -391,32 +426,30 @@ for report_file in reports:
             dkim_fail['other'], spf_fail['other'],
         ))
 
-    print('\n\n===== Owned Non-MX IPs: %s hits in %s records from %s IPs =====\n' %
+    logging.info('\n\n===== Owned Non-MX IPs: %s hits in %s records from %s IPs =====\n' %
         (hits_owned - hits_owned_mx,
         records_owned - records_owned_mx,
         len(is_owned) - len(is_mx)))
     for ip in is_owned:
         if not ip in is_mx:
-            print('%s [%s] %s records' % (ip, ptr_lookup(ip), len(is_owned[ip])))
+            logging.info('%s [%s] %s records' % (ip, ptr_lookup(ip), len(is_owned[ip])))
             for counter in is_owned[ip]:
-                print('\t* %s' % dmarc_parse_record(records[counter]))
-            print
+                logging.info('\t* %s' % dmarc_parse_record(records[counter]))
+            
 
-    print('\n\n===== Owned MX IPs: %s hits in %s records from %s IPs =====\n' %
+    logging.info('\n\n===== Owned MX IPs: %s hits in %s records from %s IPs =====\n' %
         (hits_owned_mx, records_owned_mx, len(is_mx)))
     for ip in is_mx:
-        print('%s [%s] %s records' % (ip, ptr_lookup(ip), len(is_mx[ip])))
+        logging.info('%s [%s] %s records' % (ip, ptr_lookup(ip), len(is_mx[ip])))
         for counter in is_mx[ip]:
-            print('\t* %s' % dmarc_parse_record(records[counter]))
-        print
+            logging.info('\t* %s' % dmarc_parse_record(records[counter]))
 
-    print('\n\n===== Other IPs: %s hits from %s records in %s IPs =====\n' %
+    logging.info('\n\n===== Other IPs: %s hits from %s records in %s IPs =====\n' %
         (hits_other, records_other, len(is_other)))
     for ip in is_other:
-        print('%s [%s] %s records' % (ip, ptr_lookup(ip), len(is_other[ip])))
+        logging.info('%s [%s] %s records' % (ip, ptr_lookup(ip), len(is_other[ip])))
         for counter in is_other[ip]:
-            print('\t* %s' % dmarc_parse_record(records[counter]))
-        print
+            logging.info('\t* %s' % dmarc_parse_record(records[counter]))
 
     sock = None
     port = config.get('GRAPHITE', 'port')
@@ -424,10 +457,15 @@ for report_file in reports:
     try:
         sock = socket.create_connection((host, port), timeout=0.5)
     except socket.error:
-        log('Failed to connect to graphite server at {0}:{1}'.format(
+        logging.error('Failed to connect to graphite server at {0}:{1}'.format(
             host, port))
 
     if sock:
         metrics = [make_graphite_metrics(report, ip_type) for ip_type in dkim_fail]
-        sock.sendall(''.join(metrics))
+        #sock.sendall(''.join(metrics))
+        #b = json.dumps(metrics).encode('utf-8')
+        b = str.encode(''.join(metrics))
+        #print(b)
+        sock.sendall(b)
         sock.close()
+print('All done')

@@ -1,6 +1,6 @@
-.project
-.pydevproject
-.settings/
+*.project
+*.pydevproject
+*.settings/
 config.ini
 __pycache__/
-.log
+*.log
