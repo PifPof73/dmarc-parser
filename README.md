@@ -10,6 +10,7 @@ An example is added to this repository.
 
 ## Usage
 dmarc-parser.py: parse a dmarc XML report
+
     <-f>        DMARC XML report file
     <-c>        configuration file (default: /etc/dmarc-parser/config.ini)
     <--imap>    Pull UNSEEN emails from IMAP server (as configured in config.ini)
