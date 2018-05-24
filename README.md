@@ -18,3 +18,6 @@ dmarc-parser.py: parse a dmarc XML report
     <-h>        help
 	
 where --imap is my Default.
+
+## Example graph in graphite
+![Example Graph](https://github.com/PifPof73/dmarc-parser/blob/master/dmarc_google.png)
